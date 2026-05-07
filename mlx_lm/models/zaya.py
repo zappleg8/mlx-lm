@@ -184,6 +184,18 @@ class ZayaAttention(nn.Module):
             args.hidden_size,
             bias=args.attention_bias,
         )
+        # Partial RoPE: rotates first 64 of 128 head dims; traditional=False
+        # matches modular_zaya.py's apply_rotary_pos_emb (NeoX style).
+        # Validated against PyTorch reference dumps within bf16 rounding noise
+        # (see zaya1-mlx/validation/test_partial_rope.py).
+        rotary_dim = int(
+            (args.hidden_size // args.num_attention_heads) * args.partial_rotary_factor
+        )
+        self.rope = nn.RoPE(
+            dims=rotary_dim,
+            base=args.rope_theta,
+            traditional=False,
+        )
 
 
 class ZayaRouter(nn.Module):
