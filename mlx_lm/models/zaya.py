@@ -166,6 +166,100 @@ class CCA(nn.Module):
         # Per-KV-head learnable temperature
         self.temp = mx.zeros((self.num_kv_heads,))
 
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        cca_mask: Optional[mx.array] = None,
+        past_key_values=None,
+    ):
+        """Compressed Causal Attention forward.
+
+        Args:
+          hidden_states: (B, S, H) input from the layer's input_norm.
+          cca_mask: optional (B, S) attention mask; multiplied into hidden_states
+            during prefill. If None, treated as all-ones (no masking).
+          past_key_values: ZayaDynamicCache for generation. If None, prefill
+            mode only — no conv state cache, no prev_hs cache.
+
+        Returns: (Q, K, V) flattened to HF layout (B, S, n_heads * head_dim).
+          Q: (B, S, num_q_heads * head_dim) = (B, S, 1024)
+          K: (B, S, num_kv_heads * head_dim) = (B, S, 256)
+          V: (B, S, num_kv_heads * head_dim) = (B, S, 256)
+
+        Implements modular_zaya.py:370-521 in HF (B, S, H) layout.
+        Generation-with-cache (`has_previous_state`) is deferred to Phase 4.
+        """
+        B, S, _ = hidden_states.shape
+        gqa_groups = self.num_q_heads // self.num_kv_heads  # 4
+        sqrt_head_dim = mx.array(self.head_dim ** 0.5, dtype=hidden_states.dtype)
+
+        # Apply cca_mask during prefill if S > 1 and mask is provided.
+        if cca_mask is not None and S > 1:
+            hidden_states = hidden_states * cca_mask[:, :, None]
+
+        # ---- Linear projections ----
+        q = self.linear_q(hidden_states)  # (B, S, 1024)
+        k = self.linear_k(hidden_states)  # (B, S, 256)
+        qk_packed0 = mx.concatenate([q, k], axis=-1)  # (B, S, 1280)
+
+        # ---- Pre-conv mean residual ----
+        query_pre = q.reshape(B, S, self.num_q_heads, self.head_dim)
+        key_pre_kv = k.reshape(B, S, self.num_kv_heads, self.head_dim)
+        # Repeat each KV head gqa_groups=4 times to align with num_q_heads=8.
+        key_pre = mx.expand_dims(key_pre_kv, axis=-2)  # (B, S, 2, 1, 128)
+        key_pre = mx.repeat(key_pre, gqa_groups, axis=-2)  # (B, S, 2, 4, 128)
+        key_pre = key_pre.reshape(B, S, self.num_q_heads, self.head_dim)
+        qk_mean_q = (query_pre + key_pre) / 2  # (B, S, 8, 128)
+        qk_mean_k = qk_mean_q.reshape(
+            B, S, self.num_kv_heads, gqa_groups, self.head_dim
+        ).mean(axis=-2)  # (B, S, 2, 128)
+
+        # ---- Two-stage causal conv ----
+        # MLX nn.Conv1d expects (B, S, C); pad sequence axis on front.
+        total_padding = (self.cca_time0 - 1) + (self.cca_time1 - 1)  # 2
+        qk_padded = mx.pad(qk_packed0, [(0, 0), (total_padding, 0), (0, 0)])
+        qk_packed3 = self.conv_qk(qk_padded)  # (B, S, 1280)
+
+        # ---- Build queries/keys from conv output + means ----
+        query = qk_packed3[..., : self.latent_q_dim].reshape(
+            B, S, self.num_q_heads, self.head_dim
+        ) + qk_mean_q  # (B, S, 8, 128)
+        key = qk_packed3[..., self.latent_q_dim :].reshape(
+            B, S, self.num_kv_heads, self.head_dim
+        ) + qk_mean_k  # (B, S, 2, 128)
+
+        # ---- Two-stream V ----
+        v1 = self.val_proj1(hidden_states)  # (B, S, 128)
+        # Time-shifted hidden states: drop last token, prepend a zero at front.
+        # Equivalent to PyTorch's F.pad(hs[:-1], (0,0, 0,0, 1,0)) in [S,B,H] layout.
+        if S > 1:
+            hs_shifted = mx.pad(hidden_states[:, :-1], [(0, 0), (1, 0), (0, 0)])
+        else:
+            hs_shifted = mx.zeros_like(hidden_states)
+        v2 = self.val_proj2(hs_shifted)  # (B, S, 128)
+        value = mx.concatenate([v1, v2], axis=-1).reshape(
+            B, S, self.num_kv_heads, self.head_dim
+        )  # (B, S, 2, 128)
+
+        # ---- L2 normalize Q and K, apply per-head temperature ----
+        # PyTorch's `tensor.norm(p=2, dim=-1)` on a bf16 model upcasts the
+        # sum-of-squares to fp32 internally for stability, then takes sqrt
+        # and downcasts. Mirror that to match PyTorch's reference output.
+        target_dtype = query.dtype
+        q_norm = mx.sqrt(mx.sum(query.astype(mx.float32) ** 2, axis=-1, keepdims=True)).astype(target_dtype)
+        k_norm = mx.sqrt(mx.sum(key.astype(mx.float32) ** 2, axis=-1, keepdims=True)).astype(target_dtype)
+        # temp shape (num_kv_heads,) -> (1, 1, num_kv_heads, 1) for broadcast
+        temp_b = self.temp[None, None, :, None]
+        query = query * (sqrt_head_dim / q_norm)
+        key = key * (sqrt_head_dim / k_norm) * temp_b
+
+        # ---- Flatten head axis to HF flat layout ----
+        query = query.reshape(B, S, self.num_q_heads * self.head_dim)
+        key = key.reshape(B, S, self.num_kv_heads * self.head_dim)
+        value = value.reshape(B, S, self.num_kv_heads * self.head_dim)
+
+        return query, key, value
+
 
 class ZayaAttention(nn.Module):
     """Wraps CCA + standard scaled dot product attention.
