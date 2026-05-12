@@ -887,9 +887,10 @@ class Model(nn.Module):
              Insert `.layers` between the Sequential name and the index.
           2. Conv1d weight layout: PyTorch (out, in/groups, kernel) →
              MLX (out, kernel, in/groups). Transpose conv_qk weights.
-          3. tie_word_embeddings: pop lm_head.weight defensively (HF
-             doesn't include it for ZAYA1, but mlx-lm convention is to
-             handle the general case here).
+             Idempotent: if the weight is already in MLX layout (e.g. when
+             loading an `mlx_lm.convert`-quantized checkpoint that was saved
+             from an already-sanitized model), the transpose is skipped.
+          3. tie_word_embeddings: pop lm_head.weight defensively.
         """
         import re
 
@@ -899,8 +900,13 @@ class Model(nn.Module):
         for k, v in weights.items():
             new_k = SEQ_PARENTS.sub(r".\1.layers.\2.", k)
             if "self_attn.qkv.conv_qk." in new_k and new_k.endswith(".weight"):
-                # PyTorch Conv1d (out, in/g, kernel) -> MLX (out, kernel, in/g)
-                out[new_k] = v.transpose(0, 2, 1)
+                # Detect layout: PyTorch (out, in/g, kernel=2) has shape[-1]==2;
+                # MLX (out, kernel, in/g) has shape[1]==2. Transpose only if
+                # in PyTorch layout (kernel is the last axis).
+                if v.ndim == 3 and v.shape[-1] == 2 and v.shape[1] != 2:
+                    out[new_k] = v.transpose(0, 2, 1)
+                else:
+                    out[new_k] = v
             else:
                 out[new_k] = v
         if self.args.tie_word_embeddings:
