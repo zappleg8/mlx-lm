@@ -603,7 +603,7 @@ class ZayaDecoderATTLayer(nn.Module):
 class ZayaDecoderMLPLayer(nn.Module):
     """Odd-indexed decoder layer (MoE).
 
-    Per modular_zaya.py:1425-1533. Skeleton only.
+    Per modular_zaya.py:1425-1533.
     """
 
     def __init__(self, args: ModelArgs, layer_n: int):
@@ -613,6 +613,38 @@ class ZayaDecoderMLPLayer(nn.Module):
         self.input_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_epsilon)
         if args.scale_residual_merge:
             self.res_scale = ResidualScaling(args, layer_n)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        residual: Optional[mx.array] = None,
+        mask=None,
+        cache=None,
+        prev_router_hidden_states: Optional[mx.array] = None,
+        cca_mask: Optional[mx.array] = None,
+    ):
+        """MoE decoder forward.
+
+        Per modular_zaya.py:1459-1533. Same residual+norm pattern as ATT, but
+        uses zaya_block and threads prev_router_hidden_states.
+        """
+        if hasattr(self, "res_scale"):
+            residual, hidden_states = self.res_scale(residual, hidden_states)
+
+        if residual is None:
+            residual = hidden_states.astype(mx.float32)
+        else:
+            residual = hidden_states + residual
+
+        norm_dtype = self.input_norm.weight.dtype
+        hidden_states = self.input_norm(residual.astype(norm_dtype))
+
+        # add_bias_linear=False per config; always take this branch.
+        hidden_states, _bias, prev_router_hidden_states = self.zaya_block(
+            hidden_states, prev_router_hidden_states=prev_router_hidden_states
+        )
+
+        return (hidden_states,), residual, prev_router_hidden_states
 
 
 class ZayaModel(nn.Module):
