@@ -430,7 +430,7 @@ class ZayaBlock(nn.Module):
 class ZayaDecoderATTLayer(nn.Module):
     """Even-indexed decoder layer (CCA self-attention).
 
-    Per modular_zaya.py:909-1000. Skeleton only.
+    Per modular_zaya.py:909-1000.
     """
 
     def __init__(self, args: ModelArgs, layer_n: int):
@@ -440,6 +440,45 @@ class ZayaDecoderATTLayer(nn.Module):
         self.input_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_epsilon)
         if args.scale_residual_merge:
             self.res_scale = ResidualScaling(args, layer_n)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        residual: Optional[mx.array] = None,
+        mask=None,
+        cache=None,
+        prev_router_hidden_states: Optional[mx.array] = None,
+        cca_mask: Optional[mx.array] = None,
+    ):
+        """ATT decoder forward.
+
+        Returns:
+            outputs: (hidden_states,) — single-element tuple matching the
+                PyTorch convention.
+            residual: the updated residual stream (fp32 when residual_in_fp32).
+            prev_router_hidden_states: passed through unchanged (ATT layers
+                don't run a router).
+        """
+        # 1. Optional ResidualScaling affine on both streams.
+        if hasattr(self, "res_scale"):
+            residual, hidden_states = self.res_scale(residual, hidden_states)
+
+        # 2. Initialize residual on the first layer, or accumulate.
+        if residual is None:
+            residual = hidden_states.astype(mx.float32)
+        else:
+            residual = hidden_states + residual
+
+        # 3. Pre-norm based on the accumulated residual (downcast to the norm's dtype).
+        norm_dtype = self.input_norm.weight.dtype
+        hidden_states = self.input_norm(residual.astype(norm_dtype))
+
+        # 4. Attention block.
+        hidden_states = self.self_attn(
+            hidden_states, mask=mask, cache=cache, cca_mask=cca_mask
+        )
+
+        return (hidden_states,), residual, prev_router_hidden_states
 
 
 class ZayaDecoderMLPLayer(nn.Module):
