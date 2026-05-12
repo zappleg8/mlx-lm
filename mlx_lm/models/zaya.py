@@ -650,7 +650,7 @@ class ZayaDecoderMLPLayer(nn.Module):
 class ZayaModel(nn.Module):
     """Embedding + 80 alternating decoder layers + final ResidualScaling + final RMSNorm.
 
-    Per modular_zaya.py:1642-1956. Skeleton only.
+    Per modular_zaya.py:1642-1956.
     """
 
     def __init__(self, args: ModelArgs):
@@ -666,6 +666,50 @@ class ZayaModel(nn.Module):
             # Final residual scaling, layer_n = num_hidden_layers (always non-first)
             self.res_scale = ResidualScaling(args, args.num_hidden_layers)
         self.final_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_epsilon)
+
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+    ):
+        """Full forward through 80 alternating decoder layers.
+
+        Args:
+          inputs: (B, S) int token ids. Ignored if input_embeddings is given.
+          cache: per-layer KV cache list (Phase 10+). None for prefill/parity.
+          input_embeddings: (B, S, hidden_size) pre-computed embeddings.
+
+        Returns: (B, S, hidden_size) pre-lm_head hidden state (post-final_norm).
+        """
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
+
+        residual = None
+        prev_router_hs = None
+
+        for layer in self.layers:
+            outputs, residual, prev_router_hs = layer(
+                hidden_states=h,
+                residual=residual,
+                mask="causal",
+                cache=None,
+                prev_router_hidden_states=prev_router_hs,
+            )
+            h = outputs[0]
+
+        # Final residual merge.
+        if hasattr(self, "res_scale"):
+            residual, h = self.res_scale(residual, h)
+        if residual is None:
+            residual = h.astype(mx.float32)
+        else:
+            residual = h + residual
+
+        norm_dtype = self.final_norm.weight.dtype
+        return self.final_norm(residual.astype(norm_dtype))
 
 
 class Model(nn.Module):
