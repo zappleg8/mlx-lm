@@ -411,6 +411,52 @@ class ZayaRouter(nn.Module):
             init_bb = [0.0] * self.num_experts
         self.balancing_biases = mx.array(init_bb)
 
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        router_states: Optional[mx.array] = None,
+    ):
+        """Router forward.
+
+        Args:
+          hidden_states: (B, S, H) — the layer's pre-router input.
+          router_states: (B, S, mlp_expansion=256) from the previous MoE
+            layer's router. None at the first MoE layer.
+
+        Returns:
+          route_prob_flat: (B*S, 1) gathered probabilities for chosen experts.
+          expert_choice_flat: (B*S, 1) chosen expert indices.
+          router_hidden_states_next: (B, S, mlp_expansion) the pre-norm
+            post-EDA hs, to feed the next MoE layer's router (EDA chain).
+        """
+        hs = self.down_proj(hidden_states)  # (B, S, mlp_expansion=256)
+
+        if self.use_eda and router_states is not None:
+            hs = hs + router_states * self.router_states_scale
+
+        # Stash pre-norm post-EDA hs for the next router.
+        router_hidden_states_next = hs
+
+        # Normalize, then MLP to expert logits.
+        hs_norm = self.rmsnorm_eda(hs)
+        logits = self.router_mlp(hs_norm)  # (B, S, num_experts)
+
+        # Expert probabilities (in input dtype) and selection (in fp32 to
+        # match PyTorch's `probs.detach().to(torch.float32) + biases`).
+        expert_prob = mx.softmax(logits, axis=-1)
+        biased = expert_prob.astype(mx.float32) + self.balancing_biases.astype(mx.float32)
+
+        # Top-1 selection.
+        expert_choice = mx.argmax(biased, axis=-1, keepdims=True)  # (B, S, 1)
+
+        # Gather the chosen expert's probability.
+        route_prob = mx.take_along_axis(expert_prob, expert_choice, axis=-1)
+
+        route_prob_flat = route_prob.reshape(-1, 1)
+        expert_choice_flat = expert_choice.reshape(-1, 1)
+
+        return route_prob_flat, expert_choice_flat, router_hidden_states_next
+
 
 class ZayaBlock(nn.Module):
     """MoE block: router + experts + MoD skip. Per modular_zaya.py:1329-1422.
@@ -425,6 +471,79 @@ class ZayaBlock(nn.Module):
         # SequentialMLP holds num_experts MLPs (the skip-expert is handled by
         # passing tokens through unchanged in code; not a real MLP).
         self.experts = SequentialMLP(args, args.num_experts)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        prev_router_hidden_states: Optional[mx.array] = None,
+    ):
+        """MoE block forward.
+
+        Args:
+          hidden_states: (B, S, H).
+          prev_router_hidden_states: (B, S, mlp_expansion) for EDA chain;
+            None at the first MoE layer.
+
+        Returns:
+          expert_output: (B, S, H) — gated MoE output.
+          mlp_bias: None.
+          router_hidden_states_next: (B, S, mlp_expansion) for the next
+            MoE layer's EDA.
+        """
+        B, S, H = hidden_states.shape
+        route_prob, expert_choice, router_hidden_states_next = self.router(
+            hidden_states, router_states=prev_router_hidden_states
+        )
+
+        # Flatten batch and sequence for routing.
+        hidden_flat = hidden_states.reshape(B * S, H)
+        indices_flat = expert_choice.reshape(-1)  # (B*S,)
+        probs_flat = route_prob.reshape(-1)  # (B*S,)
+
+        # Sort tokens by their assigned expert.
+        sort_order = mx.argsort(indices_flat)
+        sorted_indices = indices_flat[sort_order]
+        sorted_hidden = hidden_flat[sort_order]
+
+        # Tokens per expert (no native bincount; one-hot + sum).
+        num_experts = self.router.num_experts
+        expert_ids = mx.arange(num_experts)
+        one_hot = mx.equal(sorted_indices[:, None], expert_ids[None, :])
+        tokens_per_expert = mx.sum(one_hot, axis=0).astype(mx.int32)
+
+        # Run each real expert on its slice; MoD routes skip-expert tokens
+        # through unchanged.
+        num_real_experts = num_experts - 1 if self.use_mod else num_experts
+        real_chunks = []
+        cursor = 0
+        for e in range(num_real_experts):
+            count = int(tokens_per_expert[e].item())
+            if count == 0:
+                continue
+            chunk = sorted_hidden[cursor : cursor + count]
+            real_chunks.append(self.experts.local_experts[e](chunk))
+            cursor += count
+
+        if self.use_mod:
+            skip_count = int(tokens_per_expert[num_real_experts].item())
+            if skip_count > 0:
+                real_chunks.append(sorted_hidden[cursor : cursor + skip_count])
+
+        expert_output_sorted = (
+            mx.concatenate(real_chunks, axis=0)
+            if real_chunks
+            else mx.zeros_like(sorted_hidden)
+        )
+
+        # Un-permute back to original token order.
+        original_order = mx.argsort(sort_order)
+        expert_output = expert_output_sorted[original_order]
+        expert_output = expert_output.reshape(B, S, H)
+
+        # Scale each token's output by its routing probability.
+        expert_output = expert_output * probs_flat.reshape(B, S, 1)
+
+        return expert_output, None, router_hidden_states_next
 
 
 class ZayaDecoderATTLayer(nn.Module):
