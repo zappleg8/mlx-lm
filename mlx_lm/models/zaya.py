@@ -24,12 +24,24 @@ class ModelArgs(BaseModelArgs):
     model_type: str = "zaya"
     hidden_size: int = 2048
     num_hidden_layers: int = 80
-    num_attention_heads: int = 16
+    # In the May-2026 HF config update, `num_attention_heads` was changed from
+    # 16 (legacy: the pre-CCA "uncompressed" head count) to 8 (the effective
+    # Q head count after CCA's hardcoded compression). We default to the new
+    # convention; the old `cca_num_q_heads` field is still accepted via
+    # `__post_init__` for backward compatibility with the original config.
+    num_attention_heads: int = 8
     num_key_value_heads: int = 2
     num_query_groups: int = 2
-    cca_num_q_heads: int = 8
+    # Optional override: in the legacy config, num_attention_heads was 16 and
+    # `cca_num_q_heads=8` carried the effective count. If present, it overrides
+    # num_attention_heads.
+    cca_num_q_heads: Optional[int] = None
     cca_time0: int = 2
     cca_time1: int = 2
+    # head_dim — preferred name in the new config; `kv_channels` is the legacy
+    # field name. Both equal 128 in practice.
+    head_dim: Optional[int] = None
+    kv_channels: int = 128
     ffn_hidden_size: int = 4096
     num_experts: int = 16
     moe_router_topk: int = 1
@@ -50,9 +62,13 @@ class ModelArgs(BaseModelArgs):
     scale_residual_merge: bool = True
     activation_func: str = "swiglu"
 
-    @property
-    def head_dim(self) -> int:
-        return self.hidden_size // self.num_attention_heads
+    def __post_init__(self):
+        # Resolve cca_num_q_heads from num_attention_heads when not provided.
+        if self.cca_num_q_heads is None:
+            self.cca_num_q_heads = self.num_attention_heads
+        # Resolve head_dim from kv_channels when not provided.
+        if self.head_dim is None:
+            self.head_dim = self.kv_channels
 
 
 # Hardcoded in modular_zaya.py:1089. EDA is gated off for the first MoE layer
@@ -129,9 +145,13 @@ class CCA(nn.Module):
         self.layer_number = layer_number
         self.hidden_size = args.hidden_size
         self.num_kv_heads = args.num_query_groups  # 2
+        # cca_num_q_heads is resolved in ModelArgs.__post_init__ to equal
+        # num_attention_heads when not provided. Both conventions land here at 8.
         self.num_q_heads = args.cca_num_q_heads  # 8
-        self.num_heads = args.num_attention_heads  # 16 (for head_dim calc)
-        self.head_dim = args.hidden_size // self.num_heads  # 128
+        # head_dim comes directly from args, NOT derived from
+        # hidden_size/num_attention_heads — the latter would break under the
+        # new config convention (num_attention_heads=8 → wrong 256).
+        self.head_dim = args.head_dim  # 128
         self.latent_k_dim = self.num_kv_heads * self.head_dim  # 256
         self.latent_q_dim = self.num_q_heads * self.head_dim  # 1024
         self.cca_time0 = args.cca_time0
@@ -282,9 +302,11 @@ class ZayaAttention(nn.Module):
         # matches modular_zaya.py's apply_rotary_pos_emb (NeoX style).
         # Validated against PyTorch reference dumps within bf16 rounding noise
         # (see zaya1-mlx/validation/test_partial_rope.py).
-        rotary_dim = int(
-            (args.hidden_size // args.num_attention_heads) * args.partial_rotary_factor
-        )
+        # NB: head_dim comes from args.head_dim directly. Deriving from
+        # hidden_size/num_attention_heads is brittle: the May-2026 config
+        # change made num_attention_heads=8 (not 16), which would yield the
+        # wrong rotary_dim if derived rather than read from head_dim/kv_channels.
+        rotary_dim = int(args.head_dim * args.partial_rotary_factor)
         self.rope = nn.RoPE(
             dims=rotary_dim,
             base=args.rope_theta,
