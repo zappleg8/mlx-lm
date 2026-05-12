@@ -738,11 +738,20 @@ class Model(nn.Module):
     def n_kv_heads(self) -> int:
         return self.args.num_key_value_heads
 
-    def __call__(self, inputs: mx.array, cache=None) -> mx.array:
-        # Phase 1 stub. Phase 9 will implement the real forward.
-        raise NotImplementedError(
-            "Zaya forward is implemented in Phase 9; this skeleton supports weight loading only."
-        )
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Full ZayaForCausalLM forward.
+
+        Returns: (B, S, vocab_size) logits.
+        """
+        h = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(h)
+        return self.lm_head(h)
 
     def sanitize(self, weights: dict) -> dict:
         """Remap HF safetensors keys to MLX keys.
