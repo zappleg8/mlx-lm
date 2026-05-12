@@ -16,7 +16,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs
+from .base import BaseModelArgs, scaled_dot_product_attention
 
 
 @dataclass
@@ -290,6 +290,61 @@ class ZayaAttention(nn.Module):
             base=args.rope_theta,
             traditional=False,
         )
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        mask: Optional[mx.array] = None,
+        cache=None,
+        cca_mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        """ZayaAttention forward.
+
+        Args:
+          hidden_states: (B, S, H) — output of the layer's input_norm.
+          mask: causal mask. Pass "causal" string for the default; pass an
+            additive mask tensor of shape (B, 1, S, S) for custom shapes.
+          cache: KV cache (mlx-lm style). For Phase 4 parity tests we use
+            cache=None.
+          cca_mask: optional padding mask threaded through to CCA.
+
+        Returns: (B, S, hidden_size) attention output post o_proj.
+
+        Implements modular_zaya.py:566-656 (eager path).
+        """
+        B, S, _ = hidden_states.shape
+        # CCA produces compressed Q (8 heads of 128), K and V (each 2 heads of 128).
+        num_q_heads = self.qkv.num_q_heads  # 8
+        num_kv_heads = self.qkv.num_kv_heads  # 2
+        head_dim = self.qkv.head_dim  # 128
+
+        q_flat, k_flat, v_flat = self.qkv(
+            hidden_states, cca_mask=cca_mask, past_key_values=None
+        )
+
+        # Reshape into (B, n_heads, S, D) for attention
+        queries = q_flat.reshape(B, S, num_q_heads, head_dim).transpose(0, 2, 1, 3)
+        keys = k_flat.reshape(B, S, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+        values = v_flat.reshape(B, S, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+
+        # Apply partial RoPE.
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
+
+        # mlx-lm's helper handles GQA when n_q_heads > n_kv_heads automatically.
+        scale = head_dim ** -0.5
+        attn_out = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=scale, mask=mask
+        )
+
+        # (B, n_heads=8, S, D=128) → (B, S, n_heads * D = 1024) → o_proj → (B, S, hidden_size)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, num_q_heads * head_dim)
+        return self.o_proj(attn_out)
 
 
 class ZayaRouter(nn.Module):
