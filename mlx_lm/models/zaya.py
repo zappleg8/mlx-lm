@@ -17,6 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, scaled_dot_product_attention
+from .cache import KVCache, _BaseCache
 
 
 @dataclass
@@ -74,6 +75,75 @@ class ModelArgs(BaseModelArgs):
 # Hardcoded in modular_zaya.py:1089. EDA is gated off for the first MoE layer
 # in the global decoder layer index (which is layer 1 since layer 0 is ATT).
 ZAYA_FIRST_MOE_LAYER = 1
+
+# Per `ZayaDynamicCache` in modular_zaya.py:241. The depthwise conv kernel is 2,
+# so we cache the last 2 timesteps of qk_packed0 for generation-mode conv.
+CCA_CONV_KERNEL_SIZE = 2
+
+
+class ZayaCCACache(KVCache):
+    """Cache for a single ATT layer: standard K/V cache + CCA-specific state.
+
+    CCA's depthwise conv on Q+K needs the previous `CCA_CONV_KERNEL_SIZE` (=2)
+    timesteps to produce a correct output at the current step. CCA's V2 stream
+    needs the previous step's input hidden_states (the "time-shifted" hs).
+
+    Both extra states are initialized lazily on first use; before that they
+    are None and `state` returns just the K/V state.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # conv_states shape: (B, in_out_ch=1280, CCA_CONV_KERNEL_SIZE=2)
+        self.conv_states: Optional[mx.array] = None
+        # prev_hs shape: (B, hidden_size=2048)
+        self.prev_hs: Optional[mx.array] = None
+
+    @property
+    def state(self):
+        base_state = super().state if not super().empty() else (None, None)
+        return (*base_state, self.conv_states, self.prev_hs)
+
+    @state.setter
+    def state(self, v):
+        keys, values, conv_states, prev_hs = v
+        if keys is not None:
+            # KVCache parent setter expects (keys, values)
+            KVCache.state.fset(self, (keys, values))
+        self.conv_states = conv_states
+        self.prev_hs = prev_hs
+
+    @property
+    def nbytes(self):
+        n = super().nbytes
+        for a in (self.conv_states, self.prev_hs):
+            if a is not None:
+                n += a.nbytes
+        return n
+
+
+class _NoOpCache(_BaseCache):
+    """Empty cache for MoE layers (no state to maintain across decode steps)."""
+
+    @property
+    def offset(self):
+        return 0
+
+    def empty(self):
+        return True
+
+    @property
+    def nbytes(self):
+        return 0
+
+    @property
+    def state(self):
+        return []
+
+    @state.setter
+    def state(self, v):
+        if v is not None and v:
+            raise ValueError("_NoOpCache has no state")
 
 
 class ResidualScaling(nn.Module):
@@ -212,6 +282,11 @@ class CCA(nn.Module):
         B, S, _ = hidden_states.shape
         gqa_groups = self.num_q_heads // self.num_kv_heads  # 4
         sqrt_head_dim = mx.array(self.head_dim ** 0.5, dtype=hidden_states.dtype)
+        # Are we in single-token decode with a populated cache?
+        gen_mode = (
+            past_key_values is not None
+            and getattr(past_key_values, "conv_states", None) is not None
+        )
 
         # Apply cca_mask during prefill if S > 1 and mask is provided.
         if cca_mask is not None and S > 1:
@@ -235,10 +310,32 @@ class CCA(nn.Module):
         ).mean(axis=-2)  # (B, S, 2, 128)
 
         # ---- Two-stage causal conv ----
-        # MLX nn.Conv1d expects (B, S, C); pad sequence axis on front.
+        # MLX nn.Conv1d expects (B, S, C).
+        # During prefill (or no cache): left-pad the sequence by total_padding=2.
+        # During generation: prepend the cached previous CCA_CONV_KERNEL_SIZE
+        # timesteps of qk_packed0; receptive field of the two kernel=2 convs is
+        # 3, so 2 cached + 1 current = correct output length 1.
         total_padding = (self.cca_time0 - 1) + (self.cca_time1 - 1)  # 2
-        qk_padded = mx.pad(qk_packed0, [(0, 0), (total_padding, 0), (0, 0)])
-        qk_packed3 = self.conv_qk(qk_padded)  # (B, S, 1280)
+        if gen_mode:
+            # past_key_values.conv_states shape: (B, in_out_ch=1280, kernel=2)
+            # Convert to (B, kernel=2, in_out_ch=1280) for MLX layout, prepend
+            # to current qk_packed0 along sequence axis.
+            cached = past_key_values.conv_states.transpose(0, 2, 1)
+            qk_combined = mx.concatenate([cached, qk_packed0], axis=1)
+            qk_packed3 = self.conv_qk(qk_combined)  # output S=1
+        else:
+            qk_padded = mx.pad(qk_packed0, [(0, 0), (total_padding, 0), (0, 0)])
+            qk_packed3 = self.conv_qk(qk_padded)  # (B, S, 1280)
+
+        # Update conv_states cache (last CCA_CONV_KERNEL_SIZE timesteps of qk_packed0).
+        if past_key_values is not None:
+            # Take the last `CCA_CONV_KERNEL_SIZE` timesteps. If S < kernel, left-pad with zeros.
+            tail = qk_packed0[:, -CCA_CONV_KERNEL_SIZE:, :]
+            if tail.shape[1] < CCA_CONV_KERNEL_SIZE:
+                pad_amt = CCA_CONV_KERNEL_SIZE - tail.shape[1]
+                tail = mx.pad(tail, [(0, 0), (pad_amt, 0), (0, 0)])
+            # Store as (B, in_out_ch, kernel) to match PyTorch's layout convention.
+            past_key_values.conv_states = tail.transpose(0, 2, 1)
 
         # ---- Build queries/keys from conv output + means ----
         query = qk_packed3[..., : self.latent_q_dim].reshape(
@@ -250,9 +347,13 @@ class CCA(nn.Module):
 
         # ---- Two-stream V ----
         v1 = self.val_proj1(hidden_states)  # (B, S, 128)
-        # Time-shifted hidden states: drop last token, prepend a zero at front.
-        # Equivalent to PyTorch's F.pad(hs[:-1], (0,0, 0,0, 1,0)) in [S,B,H] layout.
-        if S > 1:
+        # Time-shifted hidden states:
+        #   - prefill (or no cache): drop last token, prepend zero
+        #   - generation with cache: use cached prev_hs as the "previous" step
+        if gen_mode:
+            # prev_hs shape: (B, hidden_size) — unsqueeze to (B, 1, hidden_size)
+            hs_shifted = mx.expand_dims(past_key_values.prev_hs, axis=1)
+        elif S > 1:
             hs_shifted = mx.pad(hidden_states[:, :-1], [(0, 0), (1, 0), (0, 0)])
         else:
             hs_shifted = mx.zeros_like(hidden_states)
@@ -260,6 +361,10 @@ class CCA(nn.Module):
         value = mx.concatenate([v1, v2], axis=-1).reshape(
             B, S, self.num_kv_heads, self.head_dim
         )  # (B, S, 2, 128)
+
+        # Update prev_hs cache with the LAST timestep of the current input.
+        if past_key_values is not None:
+            past_key_values.prev_hs = hidden_states[:, -1, :]
 
         # ---- L2 normalize Q and K, apply per-head temperature ----
         # PyTorch's `tensor.norm(p=2, dim=-1)` on a bf16 model upcasts the
@@ -341,7 +446,7 @@ class ZayaAttention(nn.Module):
         head_dim = self.qkv.head_dim  # 128
 
         q_flat, k_flat, v_flat = self.qkv(
-            hidden_states, cca_mask=cca_mask, past_key_values=None
+            hidden_states, cca_mask=cca_mask, past_key_values=cache
         )
 
         # Reshape into (B, n_heads, S, D) for attention
@@ -690,12 +795,20 @@ class ZayaModel(nn.Module):
         residual = None
         prev_router_hs = None
 
-        for layer in self.layers:
+        # Build causal mask using mlx-lm's helper (handles cache offsets).
+        from .base import create_attention_mask
+        # Use the first ATT layer's cache for mask construction (its offset
+        # tells us where we are in the sequence).
+        first_att_cache = cache[0] if cache is not None else None
+        mask = create_attention_mask(h, first_att_cache)
+
+        for i, layer in enumerate(self.layers):
+            layer_cache = cache[i] if cache is not None else None
             outputs, residual, prev_router_hs = layer(
                 hidden_states=h,
                 residual=residual,
-                mask="causal",
-                cache=None,
+                mask=mask,
+                cache=layer_cache,
                 prev_router_hidden_states=prev_router_hs,
             )
             h = outputs[0]
@@ -752,6 +865,18 @@ class Model(nn.Module):
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(h)
         return self.lm_head(h)
+
+    def make_cache(self):
+        """Per-layer cache list for mlx_lm.generate.
+
+        ATT layers (even indices) get a ZayaCCACache for K/V + CCA-specific
+        state. MoE layers (odd indices) have no recurrent state during
+        generation — give them a no-op cache.
+        """
+        return [
+            ZayaCCACache() if i % 2 == 0 else _NoOpCache()
+            for i in range(self.args.num_hidden_layers)
+        ]
 
     def sanitize(self, weights: dict) -> dict:
         """Remap HF safetensors keys to MLX keys.
